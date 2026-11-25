@@ -1,0 +1,43 @@
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    environment:
+      SWARM_ADMIN_TOKEN: ${SWARM_ADMIN_TOKEN:?set admin token}
+      SWARM_INVITE_TOKEN: ${SWARM_INVITE_TOKEN:?set invite token}
+      SWARM_AI_KEY: ${SWARM_AI_KEY:-}
+      SWARM_AI_MODEL: ${SWARM_AI_MODEL:-}
+    volumes:
+      - swarm-data:/data
+    expose:
+      - "8000"
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz',timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+  proxy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      SWARM_DOMAIN: ${SWARM_DOMAIN:?set public domain}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      app:
+        condition: service_healthy
+volumes:
+  swarm-data:
+  caddy-data:
+  caddy-config:
