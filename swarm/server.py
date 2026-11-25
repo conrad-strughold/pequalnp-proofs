@@ -8,11 +8,13 @@ from contextlib import closing
 ROOT=Path(__file__).parent
 DB=os.environ.get("SWARM_DB",str(ROOT/"swarm.sqlite"))
 ADMIN=os.environ.get("SWARM_ADMIN_TOKEN","")
+INVITE=os.environ.get("SWARM_INVITE_TOKEN","")
 TTL=900
 def connect():
     c=sqlite3.connect(DB,timeout=10)
     c.row_factory=sqlite3.Row
     c.execute("PRAGMA foreign_keys=ON")
+    c.execute("PRAGMA busy_timeout=10000")
     return c
 def init():
     with closing(connect()) as c, c:
@@ -34,6 +36,14 @@ def required(d,k,maxlen=8000):
 def expire(c):
     c.execute("UPDATE tasks SET status='open',agent=NULL,lease=NULL,expires=NULL WHERE status='leased' AND expires<=?",(time.time(),))
 class Handler(BaseHTTPRequestHandler):
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(15)
+    def end_headers(self):
+        self.send_header("X-Content-Type-Options","nosniff")
+        self.send_header("Referrer-Policy","no-referrer")
+        self.send_header("X-Frame-Options","DENY")
+        super().end_headers()
     def send_json(self,d,status=200):
         b=json.dumps(d).encode(); self.send_response(status); self.send_header("Content-Type","application/json"); self.send_header("Cache-Control","no-store"); self.end_headers(); self.wfile.write(b)
     def do_GET(self):
@@ -52,10 +62,12 @@ class Handler(BaseHTTPRequestHandler):
             d=json.loads(self.rfile.read(n))
             if not isinstance(d,dict): raise ValueError("Object required")
             p=urlsplit(self.path).path
-            token=self.headers.get("Authorization","").removeprefix("Bearer ")
+            auth=self.headers.get("Authorization","")
+            token=auth[7:] if auth.startswith("Bearer ") else ""
             with closing(connect()) as c,c:
                 c.execute("BEGIN IMMEDIATE"); expire(c)
                 if p=="/api/register":
+                    if INVITE and not hmac.compare_digest(str(d.get("invite","")),INVITE): return self.send_json({"error":"invite required"},403)
                     name=required(d,"name",80); kind=required(d,"kind",20)
                     if kind not in ("human","agent"): raise ValueError("Invalid kind")
                     a,t=uid(),secrets.token_urlsafe(32)
@@ -63,13 +75,14 @@ class Handler(BaseHTTPRequestHandler):
                     out={"id":a,"token":t}
                 elif p.startswith("/api/admin/"):
                     if not ADMIN or not hmac.compare_digest(token,ADMIN): return self.send_json({"error":"unauthorized"},401)
-                    if p.endswith("/project"):
+                    if p=="/api/admin/project":
                         i=uid(); c.execute("INSERT INTO projects VALUES(?,?,?,?)",(i,required(d,"title",120),required(d,"description"),required(d,"criteria"))); out={"id":i}; event(c,"project",i)
-                    elif p.endswith("/task"):
+                    elif p=="/api/admin/task":
                         i=uid(); project=required(d,"project",40); parent=d.get("parent")
+                        if parent is not None and (not isinstance(parent,str) or not parent): raise ValueError("Invalid parent")
                         if parent and not c.execute("SELECT 1 FROM tasks WHERE id=? AND project=?",(parent,project)).fetchone(): raise ValueError("Invalid parent")
                         c.execute("INSERT INTO tasks(id,project,title,description,parent) VALUES(?,?,?,?,?)",(i,project,required(d,"title",120),required(d,"description"),parent)); out={"id":i}; event(c,"task",i)
-                    elif p.endswith("/review"):
+                    elif p=="/api/admin/review":
                         i=required(d,"result",40); verdict=d.get("verdict"); review=required(d,"review")
                         if verdict not in ("accepted","rejected"): raise ValueError("Invalid verdict")
                         r=c.execute("SELECT * FROM results WHERE id=? AND status='pending'",(i,)).fetchone()
@@ -104,5 +117,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(out,201 if p in ("/api/register","/api/submit") else 200)
         except (ValueError,TypeError,sqlite3.IntegrityError) as e: self.send_json({"error":str(e)},400)
 if __name__=="__main__":
+    if os.environ.get("SWARM_HOST","127.0.0.1") not in ("127.0.0.1","localhost","::1") and (len(ADMIN)<32 or len(INVITE)<32):
+        raise SystemExit("Non-loopback deployment requires admin and invite tokens of at least 32 characters")
     init()
     ThreadingHTTPServer((os.environ.get("SWARM_HOST","127.0.0.1"),int(os.environ.get("PORT","8000"))),Handler).serve_forever()
