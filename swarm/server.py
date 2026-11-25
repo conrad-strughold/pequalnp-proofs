@@ -24,6 +24,9 @@ def init():
         CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY,project TEXT REFERENCES projects(id),title TEXT NOT NULL,description TEXT NOT NULL,parent TEXT REFERENCES tasks(id),status TEXT NOT NULL DEFAULT 'open',agent TEXT,lease TEXT,expires REAL);
         CREATE TABLE IF NOT EXISTS agents(id TEXT PRIMARY KEY,name TEXT NOT NULL,kind TEXT NOT NULL,token_hash TEXT NOT NULL,seen REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS results(id TEXT PRIMARY KEY,task TEXT REFERENCES tasks(id),agent TEXT REFERENCES agents(id),summary TEXT NOT NULL,evidence TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'pending',review TEXT,created REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS review_policy(project TEXT PRIMARY KEY REFERENCES projects(id), quorum INTEGER NOT NULL CHECK(quorum BETWEEN 2 AND 9));
+        CREATE TABLE IF NOT EXISTS reviewers(project TEXT REFERENCES projects(id), agent TEXT REFERENCES agents(id), PRIMARY KEY(project,agent));
+        CREATE TABLE IF NOT EXISTS votes(result TEXT REFERENCES results(id), reviewer TEXT REFERENCES agents(id), verdict TEXT NOT NULL, rationale TEXT NOT NULL, created REAL NOT NULL, PRIMARY KEY(result,reviewer));
         CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY,kind TEXT NOT NULL,detail TEXT NOT NULL,created REAL NOT NULL);
         """)
 def uid(): return secrets.token_hex(12)
@@ -55,7 +58,7 @@ class Handler(BaseHTTPRequestHandler):
         if p!="/api/state": return self.send_json({"error":"not found"},404)
         with closing(connect()) as c,c:
             expire(c)
-            self.send_json(dict(projects=rows(c,"SELECT * FROM projects"),tasks=rows(c,"SELECT id,project,title,description,parent,status,agent,expires FROM tasks"),agents=rows(c,"SELECT id,name,kind,seen FROM agents"),results=rows(c,"SELECT * FROM results ORDER BY created DESC"),events=rows(c,"SELECT * FROM events ORDER BY id DESC LIMIT 100")))
+            self.send_json(dict(projects=rows(c,"SELECT * FROM projects"),tasks=rows(c,"SELECT id,project,title,description,parent,status,agent,expires FROM tasks"),agents=rows(c,"SELECT id,name,kind,seen FROM agents"),results=rows(c,"SELECT * FROM results ORDER BY created DESC"),review_policies=rows(c,"SELECT * FROM review_policy"),votes=rows(c,"SELECT * FROM votes"),events=rows(c,"SELECT * FROM events ORDER BY id DESC LIMIT 100")))
     def do_POST(self):
         try:
             n=int(self.headers.get("Content-Length","0"))
@@ -96,11 +99,22 @@ class Handler(BaseHTTPRequestHandler):
                             c.execute("INSERT INTO tasks(id,project,title,description,parent) VALUES(?,?,?,?,?)",(i,project,item["title"],item["description"],item["parent"]))
                             event(c,"task",i); added.append({"id":i,**item})
                         out={"added":added}
+                    elif p=="/api/admin/review-policy":
+                        project=required(d,"project",40); q=d.get("quorum")
+                        if type(q) is not int or not 2<=q<=9: raise ValueError("Quorum must be 2 to 9")
+                        if c.execute("SELECT 1 FROM results r JOIN tasks t ON r.task=t.id WHERE t.project=?",(project,)).fetchone(): raise ValueError("Set policy before first submission")
+                        c.execute("INSERT INTO review_policy VALUES(?,?) ON CONFLICT(project) DO UPDATE SET quorum=excluded.quorum",(project,q))
+                        out={"quorum":q}
+                    elif p=="/api/admin/reviewer":
+                        project=required(d,"project",40); reviewer=required(d,"agent",40)
+                        c.execute("INSERT OR IGNORE INTO reviewers VALUES(?,?)",(project,reviewer))
+                        out={"project":project,"agent":reviewer}
                     elif p=="/api/admin/review":
                         i=required(d,"result",40); verdict=d.get("verdict"); review=required(d,"review")
                         if verdict not in ("accepted","rejected"): raise ValueError("Invalid verdict")
                         r=c.execute("SELECT * FROM results WHERE id=? AND status='pending'",(i,)).fetchone()
                         if not r: raise ValueError("No pending result")
+                        if c.execute("SELECT 1 FROM review_policy p JOIN tasks t ON p.project=t.project WHERE t.id=?",(r["task"],)).fetchone(): raise ValueError("Project requires independent reviewer quorum")
                         if verdict=="accepted" and not check_evidence(r["summary"],r["evidence"])["pass"]: raise ValueError("Evidence fails structural checks; reject with explanation")
                         c.execute("UPDATE results SET status=?,review=? WHERE id=?",(verdict,review,i))
                         c.execute("UPDATE tasks SET status=?,agent=NULL,lease=NULL,expires=NULL WHERE id=?",("complete" if verdict=="accepted" else "open",r["task"])); event(c,verdict,i); out={"status":verdict}
@@ -112,6 +126,23 @@ class Handler(BaseHTTPRequestHandler):
                     if p=="/api/me":
                         current=c.execute("SELECT id,title,description,project,lease,expires FROM tasks WHERE agent=? AND status='leased'",(a,)).fetchone()
                         out={"agent":a,"task":dict(current) if current else None}
+                    elif p=="/api/review":
+                        i=required(d,"result",40); verdict=d.get("verdict"); rationale=required(d,"rationale")
+                        if verdict not in ("accepted","rejected"): raise ValueError("Invalid verdict")
+                        r=c.execute("SELECT r.*,t.project,p.quorum FROM results r JOIN tasks t ON r.task=t.id JOIN review_policy p ON t.project=p.project WHERE r.id=? AND r.status='pending'",(i,)).fetchone()
+                        if not r: raise ValueError("No pending quorum result")
+                        if r["agent"]==a: raise ValueError("Cannot review your own submission")
+                        if not c.execute("SELECT 1 FROM reviewers WHERE project=? AND agent=?",(r["project"],a)).fetchone(): return self.send_json({"error":"not appointed reviewer"},403)
+                        if verdict=="accepted" and not check_evidence(r["summary"],r["evidence"])["pass"]: raise ValueError("Evidence fails structural checks")
+                        c.execute("INSERT INTO votes VALUES(?,?,?,?,?)",(i,a,verdict,rationale,time.time()))
+                        counts={v["verdict"]:v["n"] for v in rows(c,"SELECT verdict,COUNT(*) n FROM votes WHERE result=? GROUP BY verdict",(i,))}
+                        final=verdict if counts.get(verdict,0)>=r["quorum"] else "pending"
+                        if final!="pending":
+                            c.execute("UPDATE results SET status=?,review=? WHERE id=?",(final,"Reviewer quorum reached; see individual public votes.",i))
+                            c.execute("UPDATE tasks SET status=?,agent=NULL,lease=NULL,expires=NULL WHERE id=?",("complete" if final=="accepted" else "open",r["task"]))
+                            event(c,final,i)
+                        else: event(c,"review_vote",i)
+                        out={"status":final,"counts":counts,"quorum":r["quorum"]}
                     elif p=="/api/claim":
                         if c.execute("SELECT 1 FROM tasks WHERE agent=? AND status='leased'",(a,)).fetchone(): raise ValueError("Already holding a lease")
                         project=required(d,"project",40)
