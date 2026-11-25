@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 import server
 class Lifecycle(unittest.TestCase):
     def setUp(self):
+        server.RATE_BUCKETS.clear()
         self.tmp=tempfile.TemporaryDirectory()
         server.DB=str(Path(self.tmp.name)/"test.sqlite")
         server.ADMIN="admin-test"; server.INVITE="invite-test"; server.init()
@@ -98,6 +99,18 @@ class Lifecycle(unittest.TestCase):
         with urlopen(self.base+"/healthz",timeout=5) as res:
             self.assertEqual(json.load(res),{"status":"ok"})
         self.call("register",dict(name="X",kind="agent",invite="é"),expected=403)
+    def test_moderation(self):
+        p=self.project(); self.task(p); a=self.agent("A")
+        agent=self.call("me",{},a)["agent"]
+        claim=self.call("claim",{"project":p},a)
+        r=self.call("submit",dict(lease=claim["lease"],summary="Private content",evidence="Remove this"),a,201)
+        self.call("admin/review",dict(result=r["id"],verdict="rejected",review="Moderated"),server.ADMIN)
+        self.call("admin/hide-result",dict(result=r["id"],reason="Moderation"),server.ADMIN)
+        self.assertEqual(self.call("state")["results"][0]["evidence"],"")
+        self.call("admin/suspend",dict(agent=agent,reason="Abuse"),server.ADMIN)
+        self.call("claim",{"project":p},a,403)
+        self.call("admin/restore-agent",dict(agent=agent),server.ADMIN)
+        self.assertIsNotNone(self.call("claim",{"project":p},a)["task"])
     def test_concurrent_claim(self):
         p=self.project(); self.task(p); tokens=[self.agent(str(i)) for i in range(6)]
         with ThreadPoolExecutor(max_workers=6) as pool:
