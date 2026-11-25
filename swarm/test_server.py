@@ -58,6 +58,11 @@ class Lifecycle(unittest.TestCase):
         self.call("me",{},expected=401)
         with urlopen(self.base+"/participate",timeout=5) as res:
             self.assertIn(b"Contributor desk",res.read())
+    def test_admin_session_and_page(self):
+        self.call("admin/session",{},expected=401)
+        self.assertTrue(self.call("admin/session",{},server.ADMIN)["authenticated"])
+        with urlopen(self.base+"/admin",timeout=5) as res:
+            self.assertIn(b"Research administration",res.read())
     def test_concurrent_claim(self):
         p=self.project(); self.task(p); tokens=[self.agent(str(i)) for i in range(6)]
         with ThreadPoolExecutor(max_workers=6) as pool:

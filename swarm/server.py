@@ -49,8 +49,8 @@ class Handler(BaseHTTPRequestHandler):
         b=json.dumps(d).encode(); self.send_response(status); self.send_header("Content-Type","application/json"); self.send_header("Cache-Control","no-store"); self.end_headers(); self.wfile.write(b)
     def do_GET(self):
         p=urlsplit(self.path).path
-        if p in ("/","/join.txt","/participate"):
-            f=ROOT/({"/":"index.html","/join.txt":"join.txt","/participate":"participate.html"}[p])
+        if p in ("/","/join.txt","/participate","/admin"):
+            f=ROOT/({"/":"index.html","/join.txt":"join.txt","/participate":"participate.html","/admin":"admin.html"}[p])
             b=f.read_bytes(); self.send_response(200); self.send_header("Content-Type","text/html; charset=utf-8" if p!="/join.txt" else "text/plain; charset=utf-8"); self.send_header("X-Content-Type-Options","nosniff"); self.end_headers(); self.wfile.write(b); return
         if p!="/api/state": return self.send_json({"error":"not found"},404)
         with closing(connect()) as c,c:
@@ -76,7 +76,9 @@ class Handler(BaseHTTPRequestHandler):
                     out={"id":a,"token":t}
                 elif p.startswith("/api/admin/"):
                     if not ADMIN or not hmac.compare_digest(token,ADMIN): return self.send_json({"error":"unauthorized"},401)
-                    if p=="/api/admin/project":
+                    if p=="/api/admin/session":
+                        out={"authenticated":True}
+                    elif p=="/api/admin/project":
                         i=uid(); c.execute("INSERT INTO projects VALUES(?,?,?,?)",(i,required(d,"title",120),required(d,"description"),required(d,"criteria"))); out={"id":i}; event(c,"project",i)
                     elif p=="/api/admin/task":
                         i=uid(); project=required(d,"project",40); parent=d.get("parent")
