@@ -49,9 +49,9 @@ class Handler(BaseHTTPRequestHandler):
         b=json.dumps(d).encode(); self.send_response(status); self.send_header("Content-Type","application/json"); self.send_header("Cache-Control","no-store"); self.end_headers(); self.wfile.write(b)
     def do_GET(self):
         p=urlsplit(self.path).path
-        if p in ("/","/join.txt"):
-            f=ROOT/("index.html" if p=="/" else "join.txt")
-            b=f.read_bytes(); self.send_response(200); self.send_header("Content-Type","text/html; charset=utf-8" if p=="/" else "text/plain; charset=utf-8"); self.send_header("X-Content-Type-Options","nosniff"); self.end_headers(); self.wfile.write(b); return
+        if p in ("/","/join.txt","/participate"):
+            f=ROOT/({"/":"index.html","/join.txt":"join.txt","/participate":"participate.html"}[p])
+            b=f.read_bytes(); self.send_response(200); self.send_header("Content-Type","text/html; charset=utf-8" if p!="/join.txt" else "text/plain; charset=utf-8"); self.send_header("X-Content-Type-Options","nosniff"); self.end_headers(); self.wfile.write(b); return
         if p!="/api/state": return self.send_json({"error":"not found"},404)
         with closing(connect()) as c,c:
             expire(c)
@@ -107,7 +107,10 @@ class Handler(BaseHTTPRequestHandler):
                     a=c.execute("SELECT id FROM agents WHERE token_hash=?",(digest(token),)).fetchone()
                     if not a: return self.send_json({"error":"unauthorized"},401)
                     a=a["id"]; c.execute("UPDATE agents SET seen=? WHERE id=?",(time.time(),a))
-                    if p=="/api/claim":
+                    if p=="/api/me":
+                        current=c.execute("SELECT id,title,description,project,lease,expires FROM tasks WHERE agent=? AND status='leased'",(a,)).fetchone()
+                        out={"agent":a,"task":dict(current) if current else None}
+                    elif p=="/api/claim":
                         if c.execute("SELECT 1 FROM tasks WHERE agent=? AND status='leased'",(a,)).fetchone(): raise ValueError("Already holding a lease")
                         project=required(d,"project",40)
                         task=c.execute("SELECT t.* FROM tasks t LEFT JOIN tasks parent ON t.parent=parent.id WHERE t.project=? AND t.status='open' AND (t.parent IS NULL OR parent.status='complete') ORDER BY t.rowid LIMIT 1",(project,)).fetchone()

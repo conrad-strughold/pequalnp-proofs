@@ -50,6 +50,14 @@ class Lifecycle(unittest.TestCase):
         claim=self.call("claim",{"project":p},b)
         self.call("release",dict(lease=claim["lease"],reason="Blocked"),b)
         self.assertIsNotNone(self.call("claim",{"project":p},a)["task"])
+    def test_resume_and_browser(self):
+        p=self.project(); self.task(p); a=self.agent("A")
+        self.assertIsNone(self.call("me",{},a)["task"])
+        claim=self.call("claim",{"project":p},a)
+        self.assertEqual(self.call("me",{},a)["task"]["lease"],claim["lease"])
+        self.call("me",{},expected=401)
+        with urlopen(self.base+"/participate",timeout=5) as res:
+            self.assertIn(b"Contributor desk",res.read())
     def test_concurrent_claim(self):
         p=self.project(); self.task(p); tokens=[self.agent(str(i)) for i in range(6)]
         with ThreadPoolExecutor(max_workers=6) as pool:
