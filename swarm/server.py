@@ -4,6 +4,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 from contextlib import closing
+from collections import OrderedDict
+from threading import Lock
 from strategy import propose_tasks, check_evidence
 from ai_planner import generate, validate
 from verifier import config as verifier_config, verify
@@ -13,6 +15,17 @@ DB=os.environ.get("SWARM_DB",str(ROOT/"swarm.sqlite"))
 ADMIN=os.environ.get("SWARM_ADMIN_TOKEN","")
 INVITE=os.environ.get("SWARM_INVITE_TOKEN","")
 TTL=900
+RATE_LOCK=Lock()
+RATE_BUCKETS=OrderedDict()
+def allowed(key,limit,window=60):
+    now=time.monotonic()
+    with RATE_LOCK:
+        start,count=RATE_BUCKETS.get(key,(now,0))
+        if now-start>=window: start,count=now,0
+        RATE_BUCKETS[key]=(start,count+1)
+        RATE_BUCKETS.move_to_end(key)
+        while len(RATE_BUCKETS)>10000: RATE_BUCKETS.popitem(last=False)
+        return count<limit
 def connect():
     c=sqlite3.connect(DB,timeout=10)
     c.row_factory=sqlite3.Row
@@ -32,6 +45,8 @@ def init():
         CREATE TABLE IF NOT EXISTS votes(result TEXT REFERENCES results(id), reviewer TEXT REFERENCES agents(id), verdict TEXT NOT NULL, rationale TEXT NOT NULL, created REAL NOT NULL, PRIMARY KEY(result,reviewer));
         CREATE TABLE IF NOT EXISTS task_verifiers(task TEXT PRIMARY KEY REFERENCES tasks(id), kind TEXT NOT NULL, spec TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS verification_records(result TEXT PRIMARY KEY REFERENCES results(id), kind TEXT NOT NULL, outcome TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS suspended_agents(agent TEXT PRIMARY KEY REFERENCES agents(id), reason TEXT NOT NULL, created REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS hidden_results(result TEXT PRIMARY KEY REFERENCES results(id), reason TEXT NOT NULL, created REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY,kind TEXT NOT NULL,detail TEXT NOT NULL,created REAL NOT NULL);
         CREATE INDEX IF NOT EXISTS tasks_project_status ON tasks(project,status);
         CREATE INDEX IF NOT EXISTS tasks_lease ON tasks(lease);
@@ -73,9 +88,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json({"status":"ok"})
             except sqlite3.Error: return self.send_json({"status":"unavailable"},503)
         if p!="/api/state": return self.send_json({"error":"not found"},404)
+        if not allowed(("state",self.client_address[0]),600): return self.send_json({"error":"rate limit"},429)
         with closing(connect()) as c,c:
             expire(c)
-            snapshot=dict(projects=rows(c,"SELECT * FROM projects"),tasks=rows(c,"SELECT id,project,title,description,parent,status,agent,expires FROM tasks"),agents=rows(c,"SELECT id,name,kind,seen FROM agents"),results=rows(c,"SELECT * FROM results ORDER BY created DESC"),review_policies=rows(c,"SELECT * FROM review_policy"),votes=rows(c,"SELECT * FROM votes"),task_verifiers=rows(c,"SELECT * FROM task_verifiers"),verification_records=rows(c,"SELECT * FROM verification_records"),events=rows(c,"SELECT * FROM events ORDER BY id DESC LIMIT 100"))
+            snapshot=dict(projects=rows(c,"SELECT * FROM projects"),tasks=rows(c,"SELECT id,project,title,description,parent,status,agent,expires FROM tasks"),agents=rows(c,"SELECT id,name,kind,seen FROM agents"),results=rows(c,"SELECT r.id,r.task,r.agent,CASE WHEN h.result IS NULL THEN r.summary ELSE '[withdrawn by moderator]' END AS summary,CASE WHEN h.result IS NULL THEN r.evidence ELSE '' END AS evidence,r.status,CASE WHEN h.result IS NULL THEN r.review ELSE NULL END AS review,r.created FROM results r LEFT JOIN hidden_results h ON h.result=r.id ORDER BY r.created DESC"),review_policies=rows(c,"SELECT * FROM review_policy"),votes=rows(c,"SELECT * FROM votes WHERE result NOT IN (SELECT result FROM hidden_results)"),task_verifiers=rows(c,"SELECT * FROM task_verifiers"),verification_records=rows(c,"SELECT * FROM verification_records WHERE result NOT IN (SELECT result FROM hidden_results)"),events=rows(c,"SELECT * FROM events ORDER BY id DESC LIMIT 100"))
         self.send_json(snapshot)
     def do_POST(self):
         try:
@@ -86,6 +102,8 @@ class Handler(BaseHTTPRequestHandler):
             p=urlsplit(self.path).path
             auth=self.headers.get("Authorization","")
             token=auth[7:] if auth.startswith("Bearer ") else ""
+            if not allowed(("post",self.client_address[0]),600): return self.send_json({"error":"rate limit"},429)
+            if p=="/api/register" and not allowed(("register",self.client_address[0]),30): return self.send_json({"error":"registration rate limit"},429)
             if p=="/api/admin/ai-preview":
                 if not ADMIN or not hmac.compare_digest(token.encode(),ADMIN.encode()): return self.send_json({"error":"unauthorized"},401)
                 project=required(d,"project",40)
@@ -93,7 +111,7 @@ class Handler(BaseHTTPRequestHandler):
                     pr=c.execute("SELECT * FROM projects WHERE id=?",(project,)).fetchone()
                     if not pr: raise ValueError("Unknown project")
                     tasks=rows(c,"SELECT * FROM tasks WHERE project=? ORDER BY rowid",(project,))
-                    results=rows(c,"SELECT r.* FROM results r JOIN tasks t ON r.task=t.id WHERE t.project=? ORDER BY r.created DESC LIMIT 40",(project,))
+                    results=rows(c,"SELECT r.* FROM results r JOIN tasks t ON r.task=t.id WHERE t.project=? AND r.id NOT IN (SELECT result FROM hidden_results) ORDER BY r.created DESC LIMIT 40",(project,))
                 return self.send_json({"proposals":generate(dict(pr),tasks,results),"requires_review":True})
             with closing(connect()) as c,c:
                 c.execute("BEGIN IMMEDIATE"); expire(c)
@@ -108,6 +126,21 @@ class Handler(BaseHTTPRequestHandler):
                     if not ADMIN or not hmac.compare_digest(token.encode(),ADMIN.encode()): return self.send_json({"error":"unauthorized"},401)
                     if p=="/api/admin/session":
                         out={"authenticated":True}
+                    elif p=="/api/admin/suspend":
+                        agent=required(d,"agent",40); reason=required(d,"reason",1000)
+                        c.execute("INSERT INTO suspended_agents VALUES(?,?,?) ON CONFLICT(agent) DO UPDATE SET reason=excluded.reason,created=excluded.created",(agent,reason,time.time()))
+                        c.execute("UPDATE tasks SET status='open',agent=NULL,lease=NULL,expires=NULL WHERE agent=? AND status='leased'",(agent,))
+                        out={"status":"suspended"}
+                    elif p=="/api/admin/restore-agent":
+                        agent=required(d,"agent",40)
+                        c.execute("DELETE FROM suspended_agents WHERE agent=?",(agent,))
+                        out={"status":"restored"}
+                    elif p=="/api/admin/hide-result":
+                        result=required(d,"result",40); reason=required(d,"reason",1000)
+                        r=c.execute("SELECT status FROM results WHERE id=?",(result,)).fetchone()
+                        if not r or r["status"]!="rejected": raise ValueError("Reject a result before hiding its content")
+                        c.execute("INSERT OR IGNORE INTO hidden_results VALUES(?,?,?)",(result,reason,time.time()))
+                        out={"status":"hidden"}
                     elif p=="/api/admin/project":
                         i=uid(); c.execute("INSERT INTO projects VALUES(?,?,?,?)",(i,required(d,"title",120),required(d,"description"),required(d,"criteria"))); out={"id":i}; event(c,"project",i)
                     elif p=="/api/admin/task":
@@ -167,6 +200,7 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     a=c.execute("SELECT id FROM agents WHERE token_hash=?",(digest(token),)).fetchone()
                     if not a: return self.send_json({"error":"unauthorized"},401)
+                    if c.execute("SELECT 1 FROM suspended_agents WHERE agent=?",(a["id"],)).fetchone(): return self.send_json({"error":"account suspended"},403)
                     a=a["id"]; c.execute("UPDATE agents SET seen=? WHERE id=?",(time.time(),a))
                     if p=="/api/me":
                         current=c.execute("SELECT id,title,description,project,lease,expires FROM tasks WHERE agent=? AND status='leased'",(a,)).fetchone()
