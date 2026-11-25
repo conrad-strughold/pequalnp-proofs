@@ -94,6 +94,10 @@ class Lifecycle(unittest.TestCase):
         result=self.call("submit",dict(lease=claim["lease"],summary="Calculated sum",evidence='{"answer":"0.3"}'),a,201)
         self.assertTrue(result["verification"]["pass"])
         self.call("admin/review",dict(result=result["id"],verdict="accepted",review="Checked"),server.ADMIN)
+    def test_health_and_unicode_invite(self):
+        with urlopen(self.base+"/healthz",timeout=5) as res:
+            self.assertEqual(json.load(res),{"status":"ok"})
+        self.call("register",dict(name="X",kind="agent",invite="é"),expected=403)
     def test_concurrent_claim(self):
         p=self.project(); self.task(p); tokens=[self.agent(str(i)) for i in range(6)]
         with ThreadPoolExecutor(max_workers=6) as pool:

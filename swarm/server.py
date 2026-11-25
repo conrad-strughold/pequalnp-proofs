@@ -21,6 +21,7 @@ def connect():
     return c
 def init():
     with closing(connect()) as c, c:
+        c.execute("PRAGMA journal_mode=WAL")
         c.executescript("""
         CREATE TABLE IF NOT EXISTS projects(id TEXT PRIMARY KEY,title TEXT NOT NULL,description TEXT NOT NULL,criteria TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY,project TEXT REFERENCES projects(id),title TEXT NOT NULL,description TEXT NOT NULL,parent TEXT REFERENCES tasks(id),status TEXT NOT NULL DEFAULT 'open',agent TEXT,lease TEXT,expires REAL);
@@ -32,6 +33,10 @@ def init():
         CREATE TABLE IF NOT EXISTS task_verifiers(task TEXT PRIMARY KEY REFERENCES tasks(id), kind TEXT NOT NULL, spec TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS verification_records(result TEXT PRIMARY KEY REFERENCES results(id), kind TEXT NOT NULL, outcome TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY,kind TEXT NOT NULL,detail TEXT NOT NULL,created REAL NOT NULL);
+        CREATE INDEX IF NOT EXISTS tasks_project_status ON tasks(project,status);
+        CREATE INDEX IF NOT EXISTS tasks_lease ON tasks(lease);
+        CREATE INDEX IF NOT EXISTS results_task ON results(task);
+        CREATE INDEX IF NOT EXISTS agents_token ON agents(token_hash);
         """)
 def uid(): return secrets.token_hex(12)
 def digest(s): return hashlib.sha256(s.encode()).hexdigest()
@@ -62,21 +67,27 @@ class Handler(BaseHTTPRequestHandler):
         if p in ("/","/join.txt","/participate","/admin"):
             f=ROOT/({"/":"index.html","/join.txt":"join.txt","/participate":"participate.html","/admin":"admin.html"}[p])
             b=f.read_bytes(); self.send_response(200); self.send_header("Content-Type","text/html; charset=utf-8" if p!="/join.txt" else "text/plain; charset=utf-8"); self.send_header("X-Content-Type-Options","nosniff"); self.end_headers(); self.wfile.write(b); return
+        if p=="/healthz":
+            try:
+                with closing(connect()) as c: c.execute("SELECT 1").fetchone()
+                return self.send_json({"status":"ok"})
+            except sqlite3.Error: return self.send_json({"status":"unavailable"},503)
         if p!="/api/state": return self.send_json({"error":"not found"},404)
         with closing(connect()) as c,c:
             expire(c)
-            self.send_json(dict(projects=rows(c,"SELECT * FROM projects"),tasks=rows(c,"SELECT id,project,title,description,parent,status,agent,expires FROM tasks"),agents=rows(c,"SELECT id,name,kind,seen FROM agents"),results=rows(c,"SELECT * FROM results ORDER BY created DESC"),review_policies=rows(c,"SELECT * FROM review_policy"),votes=rows(c,"SELECT * FROM votes"),task_verifiers=rows(c,"SELECT * FROM task_verifiers"),verification_records=rows(c,"SELECT * FROM verification_records"),events=rows(c,"SELECT * FROM events ORDER BY id DESC LIMIT 100")))
+            snapshot=dict(projects=rows(c,"SELECT * FROM projects"),tasks=rows(c,"SELECT id,project,title,description,parent,status,agent,expires FROM tasks"),agents=rows(c,"SELECT id,name,kind,seen FROM agents"),results=rows(c,"SELECT * FROM results ORDER BY created DESC"),review_policies=rows(c,"SELECT * FROM review_policy"),votes=rows(c,"SELECT * FROM votes"),task_verifiers=rows(c,"SELECT * FROM task_verifiers"),verification_records=rows(c,"SELECT * FROM verification_records"),events=rows(c,"SELECT * FROM events ORDER BY id DESC LIMIT 100"))
+        self.send_json(snapshot)
     def do_POST(self):
         try:
             n=int(self.headers.get("Content-Length","0"))
-            if not 0<n<=65536: raise ValueError("Invalid body length")
+            if not 0<n<=262144: raise ValueError("Invalid body length")
             d=json.loads(self.rfile.read(n))
             if not isinstance(d,dict): raise ValueError("Object required")
             p=urlsplit(self.path).path
             auth=self.headers.get("Authorization","")
             token=auth[7:] if auth.startswith("Bearer ") else ""
             if p=="/api/admin/ai-preview":
-                if not ADMIN or not hmac.compare_digest(token,ADMIN): return self.send_json({"error":"unauthorized"},401)
+                if not ADMIN or not hmac.compare_digest(token.encode(),ADMIN.encode()): return self.send_json({"error":"unauthorized"},401)
                 project=required(d,"project",40)
                 with closing(connect()) as c:
                     pr=c.execute("SELECT * FROM projects WHERE id=?",(project,)).fetchone()
@@ -87,14 +98,14 @@ class Handler(BaseHTTPRequestHandler):
             with closing(connect()) as c,c:
                 c.execute("BEGIN IMMEDIATE"); expire(c)
                 if p=="/api/register":
-                    if INVITE and not hmac.compare_digest(str(d.get("invite","")),INVITE): return self.send_json({"error":"invite required"},403)
+                    if INVITE and not hmac.compare_digest(str(d.get("invite","")).encode(),INVITE.encode()): return self.send_json({"error":"invite required"},403)
                     name=required(d,"name",80); kind=required(d,"kind",20)
                     if kind not in ("human","agent"): raise ValueError("Invalid kind")
                     a,t=uid(),secrets.token_urlsafe(32)
                     c.execute("INSERT INTO agents VALUES(?,?,?,?,?)",(a,name,kind,digest(t),time.time())); event(c,"join",name)
                     out={"id":a,"token":t}
                 elif p.startswith("/api/admin/"):
-                    if not ADMIN or not hmac.compare_digest(token,ADMIN): return self.send_json({"error":"unauthorized"},401)
+                    if not ADMIN or not hmac.compare_digest(token.encode(),ADMIN.encode()): return self.send_json({"error":"unauthorized"},401)
                     if p=="/api/admin/session":
                         out={"authenticated":True}
                     elif p=="/api/admin/project":
