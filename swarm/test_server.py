@@ -63,6 +63,25 @@ class Lifecycle(unittest.TestCase):
         self.assertTrue(self.call("admin/session",{},server.ADMIN)["authenticated"])
         with urlopen(self.base+"/admin",timeout=5) as res:
             self.assertIn(b"Research administration",res.read())
+    def test_review_quorum(self):
+        p=self.project(); self.task(p)
+        self.call("admin/review-policy",dict(project=p,quorum=2),server.ADMIN)
+        a,b,c,d=[self.agent(x) for x in ("author","reviewer1","reviewer2","outsider")]
+        for token in (a,b,c):
+            aid=self.call("me",{},token)["agent"]
+            self.call("admin/reviewer",dict(project=p,agent=aid),server.ADMIN)
+        claim=self.call("claim",{"project":p},a)
+        rid=self.call("submit",dict(lease=claim["lease"],summary="Finding",evidence="Reproduced"),a,201)["id"]
+        self.call("admin/review",dict(result=rid,verdict="accepted",review="Bypass"),server.ADMIN,400)
+        vote=dict(result=rid,verdict="accepted",rationale="Independently checked")
+        self.call("review",vote,a,400)
+        self.call("review",vote,d,403)
+        self.assertEqual(self.call("review",vote,b)["status"],"pending")
+        self.call("review",vote,b,400)
+        self.assertEqual(self.call("review",vote,c)["status"],"accepted")
+        state=self.call("state")
+        self.assertEqual(len(state["votes"]),2)
+        self.assertEqual(state["tasks"][0]["status"],"complete")
     def test_concurrent_claim(self):
         p=self.project(); self.task(p); tokens=[self.agent(str(i)) for i in range(6)]
         with ThreadPoolExecutor(max_workers=6) as pool:
