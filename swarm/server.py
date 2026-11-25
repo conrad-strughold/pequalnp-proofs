@@ -4,6 +4,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 from contextlib import closing
+from strategy import propose_tasks, check_evidence
 
 ROOT=Path(__file__).parent
 DB=os.environ.get("SWARM_DB",str(ROOT/"swarm.sqlite"))
@@ -82,11 +83,23 @@ class Handler(BaseHTTPRequestHandler):
                         if parent is not None and (not isinstance(parent,str) or not parent): raise ValueError("Invalid parent")
                         if parent and not c.execute("SELECT 1 FROM tasks WHERE id=? AND project=?",(parent,project)).fetchone(): raise ValueError("Invalid parent")
                         c.execute("INSERT INTO tasks(id,project,title,description,parent) VALUES(?,?,?,?,?)",(i,project,required(d,"title",120),required(d,"description"),parent)); out={"id":i}; event(c,"task",i)
+                    elif p=="/api/admin/plan":
+                        project=required(d,"project",40)
+                        pr=c.execute("SELECT * FROM projects WHERE id=?",(project,)).fetchone()
+                        if not pr: raise ValueError("Unknown project")
+                        existing=rows(c,"SELECT * FROM tasks WHERE project=?",(project,))
+                        added=[]
+                        for item in propose_tasks(dict(pr),existing):
+                            i=uid()
+                            c.execute("INSERT INTO tasks(id,project,title,description,parent) VALUES(?,?,?,?,?)",(i,project,item["title"],item["description"],item["parent"]))
+                            event(c,"task",i); added.append({"id":i,**item})
+                        out={"added":added}
                     elif p=="/api/admin/review":
                         i=required(d,"result",40); verdict=d.get("verdict"); review=required(d,"review")
                         if verdict not in ("accepted","rejected"): raise ValueError("Invalid verdict")
                         r=c.execute("SELECT * FROM results WHERE id=? AND status='pending'",(i,)).fetchone()
                         if not r: raise ValueError("No pending result")
+                        if verdict=="accepted" and not check_evidence(r["summary"],r["evidence"])["pass"]: raise ValueError("Evidence fails structural checks; reject with explanation")
                         c.execute("UPDATE results SET status=?,review=? WHERE id=?",(verdict,review,i))
                         c.execute("UPDATE tasks SET status=?,agent=NULL,lease=NULL,expires=NULL WHERE id=?",("complete" if verdict=="accepted" else "open",r["task"])); event(c,verdict,i); out={"status":verdict}
                     else: return self.send_json({"error":"not found"},404)
