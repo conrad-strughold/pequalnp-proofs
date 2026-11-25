@@ -5,6 +5,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from contextlib import closing
 from strategy import propose_tasks, check_evidence
+from ai_planner import generate, validate
 
 ROOT=Path(__file__).parent
 DB=os.environ.get("SWARM_DB",str(ROOT/"swarm.sqlite"))
@@ -68,6 +69,15 @@ class Handler(BaseHTTPRequestHandler):
             p=urlsplit(self.path).path
             auth=self.headers.get("Authorization","")
             token=auth[7:] if auth.startswith("Bearer ") else ""
+            if p=="/api/admin/ai-preview":
+                if not ADMIN or not hmac.compare_digest(token,ADMIN): return self.send_json({"error":"unauthorized"},401)
+                project=required(d,"project",40)
+                with closing(connect()) as c:
+                    pr=c.execute("SELECT * FROM projects WHERE id=?",(project,)).fetchone()
+                    if not pr: raise ValueError("Unknown project")
+                    tasks=rows(c,"SELECT * FROM tasks WHERE project=? ORDER BY rowid",(project,))
+                    results=rows(c,"SELECT r.* FROM results r JOIN tasks t ON r.task=t.id WHERE t.project=? ORDER BY r.created DESC LIMIT 40",(project,))
+                return self.send_json({"proposals":generate(dict(pr),tasks,results),"requires_review":True})
             with closing(connect()) as c,c:
                 c.execute("BEGIN IMMEDIATE"); expire(c)
                 if p=="/api/register":
@@ -88,6 +98,16 @@ class Handler(BaseHTTPRequestHandler):
                         if parent is not None and (not isinstance(parent,str) or not parent): raise ValueError("Invalid parent")
                         if parent and not c.execute("SELECT 1 FROM tasks WHERE id=? AND project=?",(parent,project)).fetchone(): raise ValueError("Invalid parent")
                         c.execute("INSERT INTO tasks(id,project,title,description,parent) VALUES(?,?,?,?,?)",(i,project,required(d,"title",120),required(d,"description"),parent)); out={"id":i}; event(c,"task",i)
+                    elif p=="/api/admin/ai-apply":
+                        project=required(d,"project",40)
+                        if not c.execute("SELECT 1 FROM projects WHERE id=?",(project,)).fetchone(): raise ValueError("Unknown project")
+                        existing=rows(c,"SELECT * FROM tasks WHERE project=?",(project,))
+                        added=[]
+                        for item in validate({"tasks":d.get("tasks")},existing):
+                            i=uid()
+                            c.execute("INSERT INTO tasks(id,project,title,description,parent) VALUES(?,?,?,?,?)",(i,project,item["title"],item["description"],item["parent"]))
+                            event(c,"task",i); added.append({"id":i,**item})
+                        out={"added":added}
                     elif p=="/api/admin/plan":
                         project=required(d,"project",40)
                         pr=c.execute("SELECT * FROM projects WHERE id=?",(project,)).fetchone()
