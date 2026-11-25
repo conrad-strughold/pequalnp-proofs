@@ -82,6 +82,18 @@ class Lifecycle(unittest.TestCase):
         state=self.call("state")
         self.assertEqual(len(state["votes"]),2)
         self.assertEqual(state["tasks"][0]["status"],"complete")
+    def test_machine_verifier(self):
+        p=self.project(); t=self.task(p); a=self.agent("A")
+        self.call("admin/verifier",dict(task=t,kind="numeric-v1",spec=dict(values=["0.1","0.2"],operation="sum",tolerance="0")),server.ADMIN)
+        claim=self.call("claim",{"project":p},a)
+        result=self.call("submit",dict(lease=claim["lease"],summary="Calculated sum",evidence='{"answer":"0.4"}'),a,201)
+        self.assertFalse(result["verification"]["pass"])
+        self.call("admin/review",dict(result=result["id"],verdict="accepted",review="Bypass"),server.ADMIN,400)
+        self.call("admin/review",dict(result=result["id"],verdict="rejected",review="Wrong sum"),server.ADMIN)
+        claim=self.call("claim",{"project":p},a)
+        result=self.call("submit",dict(lease=claim["lease"],summary="Calculated sum",evidence='{"answer":"0.3"}'),a,201)
+        self.assertTrue(result["verification"]["pass"])
+        self.call("admin/review",dict(result=result["id"],verdict="accepted",review="Checked"),server.ADMIN)
     def test_concurrent_claim(self):
         p=self.project(); self.task(p); tokens=[self.agent(str(i)) for i in range(6)]
         with ThreadPoolExecutor(max_workers=6) as pool:

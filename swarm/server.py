@@ -6,6 +6,7 @@ from urllib.parse import urlsplit
 from contextlib import closing
 from strategy import propose_tasks, check_evidence
 from ai_planner import generate, validate
+from verifier import config as verifier_config, verify
 
 ROOT=Path(__file__).parent
 DB=os.environ.get("SWARM_DB",str(ROOT/"swarm.sqlite"))
@@ -28,6 +29,8 @@ def init():
         CREATE TABLE IF NOT EXISTS review_policy(project TEXT PRIMARY KEY REFERENCES projects(id), quorum INTEGER NOT NULL CHECK(quorum BETWEEN 2 AND 9));
         CREATE TABLE IF NOT EXISTS reviewers(project TEXT REFERENCES projects(id), agent TEXT REFERENCES agents(id), PRIMARY KEY(project,agent));
         CREATE TABLE IF NOT EXISTS votes(result TEXT REFERENCES results(id), reviewer TEXT REFERENCES agents(id), verdict TEXT NOT NULL, rationale TEXT NOT NULL, created REAL NOT NULL, PRIMARY KEY(result,reviewer));
+        CREATE TABLE IF NOT EXISTS task_verifiers(task TEXT PRIMARY KEY REFERENCES tasks(id), kind TEXT NOT NULL, spec TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS verification_records(result TEXT PRIMARY KEY REFERENCES results(id), kind TEXT NOT NULL, outcome TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY,kind TEXT NOT NULL,detail TEXT NOT NULL,created REAL NOT NULL);
         """)
 def uid(): return secrets.token_hex(12)
@@ -38,6 +41,9 @@ def required(d,k,maxlen=8000):
     v=d.get(k)
     if not isinstance(v,str) or not v.strip() or len(v)>maxlen: raise ValueError("Invalid "+k)
     return v.strip()
+def machine_pass(c,result):
+    row=c.execute("SELECT outcome FROM verification_records WHERE result=?",(result,)).fetchone()
+    return row is None or json.loads(row["outcome"])["pass"]
 def expire(c):
     c.execute("UPDATE tasks SET status='open',agent=NULL,lease=NULL,expires=NULL WHERE status='leased' AND expires<=?",(time.time(),))
 class Handler(BaseHTTPRequestHandler):
@@ -59,7 +65,7 @@ class Handler(BaseHTTPRequestHandler):
         if p!="/api/state": return self.send_json({"error":"not found"},404)
         with closing(connect()) as c,c:
             expire(c)
-            self.send_json(dict(projects=rows(c,"SELECT * FROM projects"),tasks=rows(c,"SELECT id,project,title,description,parent,status,agent,expires FROM tasks"),agents=rows(c,"SELECT id,name,kind,seen FROM agents"),results=rows(c,"SELECT * FROM results ORDER BY created DESC"),review_policies=rows(c,"SELECT * FROM review_policy"),votes=rows(c,"SELECT * FROM votes"),events=rows(c,"SELECT * FROM events ORDER BY id DESC LIMIT 100")))
+            self.send_json(dict(projects=rows(c,"SELECT * FROM projects"),tasks=rows(c,"SELECT id,project,title,description,parent,status,agent,expires FROM tasks"),agents=rows(c,"SELECT id,name,kind,seen FROM agents"),results=rows(c,"SELECT * FROM results ORDER BY created DESC"),review_policies=rows(c,"SELECT * FROM review_policy"),votes=rows(c,"SELECT * FROM votes"),task_verifiers=rows(c,"SELECT * FROM task_verifiers"),verification_records=rows(c,"SELECT * FROM verification_records"),events=rows(c,"SELECT * FROM events ORDER BY id DESC LIMIT 100")))
     def do_POST(self):
         try:
             n=int(self.headers.get("Content-Length","0"))
@@ -119,6 +125,13 @@ class Handler(BaseHTTPRequestHandler):
                             c.execute("INSERT INTO tasks(id,project,title,description,parent) VALUES(?,?,?,?,?)",(i,project,item["title"],item["description"],item["parent"]))
                             event(c,"task",i); added.append({"id":i,**item})
                         out={"added":added}
+                    elif p=="/api/admin/verifier":
+                        task=required(d,"task",40); kind=required(d,"kind",40); spec=d.get("spec")
+                        verifier_config(kind,spec)
+                        t=c.execute("SELECT status FROM tasks WHERE id=?",(task,)).fetchone()
+                        if not t or t["status"]!="open" or c.execute("SELECT 1 FROM results WHERE task=?",(task,)).fetchone(): raise ValueError("Set verifier on an unclaimed task before submissions")
+                        c.execute("INSERT INTO task_verifiers VALUES(?,?,?)",(task,kind,json.dumps(spec)))
+                        out={"task":task,"kind":kind}
                     elif p=="/api/admin/review-policy":
                         project=required(d,"project",40); q=d.get("quorum")
                         if type(q) is not int or not 2<=q<=9: raise ValueError("Quorum must be 2 to 9")
@@ -135,6 +148,7 @@ class Handler(BaseHTTPRequestHandler):
                         r=c.execute("SELECT * FROM results WHERE id=? AND status='pending'",(i,)).fetchone()
                         if not r: raise ValueError("No pending result")
                         if c.execute("SELECT 1 FROM review_policy p JOIN tasks t ON p.project=t.project WHERE t.id=?",(r["task"],)).fetchone(): raise ValueError("Project requires independent reviewer quorum")
+                        if verdict=="accepted" and not machine_pass(c,r["id"]): raise ValueError("Machine verification failed")
                         if verdict=="accepted" and not check_evidence(r["summary"],r["evidence"])["pass"]: raise ValueError("Evidence fails structural checks; reject with explanation")
                         c.execute("UPDATE results SET status=?,review=? WHERE id=?",(verdict,review,i))
                         c.execute("UPDATE tasks SET status=?,agent=NULL,lease=NULL,expires=NULL WHERE id=?",("complete" if verdict=="accepted" else "open",r["task"])); event(c,verdict,i); out={"status":verdict}
@@ -153,6 +167,7 @@ class Handler(BaseHTTPRequestHandler):
                         if not r: raise ValueError("No pending quorum result")
                         if r["agent"]==a: raise ValueError("Cannot review your own submission")
                         if not c.execute("SELECT 1 FROM reviewers WHERE project=? AND agent=?",(r["project"],a)).fetchone(): return self.send_json({"error":"not appointed reviewer"},403)
+                        if verdict=="accepted" and not machine_pass(c,r["id"]): raise ValueError("Machine verification failed")
                         if verdict=="accepted" and not check_evidence(r["summary"],r["evidence"])["pass"]: raise ValueError("Evidence fails structural checks")
                         c.execute("INSERT INTO votes VALUES(?,?,?,?,?)",(i,a,verdict,rationale,time.time()))
                         counts={v["verdict"]:v["n"] for v in rows(c,"SELECT verdict,COUNT(*) n FROM votes WHERE result=? GROUP BY verdict",(i,))}
@@ -182,6 +197,11 @@ class Handler(BaseHTTPRequestHandler):
                             reason=required(d,"reason",1000); c.execute("UPDATE tasks SET status='open',agent=NULL,lease=NULL,expires=NULL WHERE id=?",(t["id"],)); event(c,"release",t["id"]+": "+reason); out={"status":"open"}
                         else:
                             i=uid(); c.execute("INSERT INTO results(id,task,agent,summary,evidence,created) VALUES(?,?,?,?,?,?)",(i,t["id"],a,required(d,"summary"),required(d,"evidence",30000),time.time())); c.execute("UPDATE tasks SET status='review',lease=NULL,expires=NULL WHERE id=?",(t["id"],)); event(c,"submit",i); out={"id":i,"status":"pending"}
+                            rule=c.execute("SELECT * FROM task_verifiers WHERE task=?",(t["id"],)).fetchone()
+                            if rule:
+                                outcome=verify(rule["kind"],json.loads(rule["spec"]),d["evidence"])
+                                c.execute("INSERT INTO verification_records VALUES(?,?,?)",(i,rule["kind"],json.dumps(outcome)))
+                                out["verification"]=outcome
                     else: return self.send_json({"error":"not found"},404)
             self.send_json(out,201 if p in ("/api/register","/api/submit") else 200)
         except (ValueError,TypeError,sqlite3.IntegrityError) as e: self.send_json({"error":str(e)},400)
