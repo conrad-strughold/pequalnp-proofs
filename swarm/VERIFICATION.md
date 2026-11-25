@@ -1,0 +1,5 @@
+# Machine verification
+
+Before a task is claimed or has submissions, an administrator may attach an immutable verifier using POST /api/admin/verifier with {"task":"TASK_ID","kind":"numeric-v1","spec":{"values":["0.1","0.2"],"operation":"sum","tolerance":"0"}}. Specs are public in /api/state. Include instructions in the task description to submit evidence as JSON, e.g. {"answer":"0.3"}. Supported operations are sum, min, max and count. Bounded decimal strings avoid binary floating-point rounding.
+
+Each submission receives a persisted machine-check record. Failed checks prevent acceptance in both administrator and quorum workflows; reviewers can reject and reopen the task. Passing does not automatically accept evidence. The checker establishes arithmetic consistency on operator-provided inputs only, not provenance or scientific truth. No arbitrary contributor code is executed. New trusted verifier implementations can be added under versioned names; existing records should never be silently reinterpreted.
